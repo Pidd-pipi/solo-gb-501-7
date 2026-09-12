@@ -1,0 +1,19 @@
+{
+  "name": "sterile-release-system",
+  "version": "1.0.0",
+  "description": "无菌包装生产放行系统：批次登记、检验录入、不合格自动待复测、放行硬条件拦截、隔离/返工同步状态、哈希链审计",
+  "private": true,
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "node tests/store.test.js && node tests/ui.smoke.test.js",
+    "test:unit": "node tests/store.test.js",
+    "test:ui": "node tests/ui.smoke.test.js",
+    "serve": "python3 -m http.server 8080"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>无菌包装生产放行系统</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div class="app">
+    <!-- 侧边导航 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">SR</div>
+        <div>
+          <div class="brand-title">无菌包装放行系统</div>
+          <div class="brand-sub">Sterile Release · ISO 11607</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <a class="nav-item" data-route="dashboard">
+          <span class="nav-ico">▦</span><span>总览</span><span class="nav-badge" data-count="dashboard"></span>
+        </a>
+        <a class="nav-item" data-route="queue">
+          <span class="nav-ico">≣</span><span>批次队列</span><span class="nav-badge" data-count="queue"></span>
+        </a>
+        <a class="nav-item" data-route="inspection">
+          <span class="nav-ico">🧪</span><span>检验工作台</span><span class="nav-badge" data-count="inspection"></span>
+        </a>
+        <a class="nav-item" data-route="approval">
+          <span class="nav-ico">✓</span><span>放行审批</span><span class="nav-badge" data-count="approval"></span>
+        </a>
+        <a class="nav-item" data-route="audit">
+          <span class="nav-ico">🕮</span><span>审计记录</span><span class="nav-badge" data-count="audit"></span>
+        </a>
+      </nav>
+
+      <div class="sidebar-foot">
+        <button class="btn btn-ghost btn-block" data-act="manage-lines" id="linesBtn" hidden>产线维护</button>
+        <button class="btn btn-ghost btn-block btn-sm" data-act="reset-demo" id="resetBtn" hidden>重置演示数据</button>
+      </div>
+    </aside>
+
+    <!-- 主区域 -->
+    <div class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">总览</h1>
+          <div class="page-sub" id="pageSub"></div>
+        </div>
+        <div class="topbar-right">
+          <div class="req-chip" id="reqChip" title="最近一次操作请求标识"></div>
+          <div class="user-box">
+            <select id="userSelect" class="user-select" title="切换登录角色（演示）"></select>
+            <div class="user-meta">
+              <span id="userName"></span>
+              <span class="role-tag" id="userRole"></span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="content" id="view"></main>
+    </div>
+  </div>
+
+  <!-- 弹窗容器 -->
+  <div class="modal-root" id="modalRoot"></div>
+  <!-- 通知容器 -->
+  <div class="toast-root" id="toastRoot"></div>
+
+  <script src="js/data.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
