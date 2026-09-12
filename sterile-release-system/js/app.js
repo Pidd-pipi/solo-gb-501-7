@@ -13,6 +13,9 @@
   let queueFilter = 'ALL';
   let auditFilter = 'ALL';
 
+  // 当前打开的弹窗上下文：{ kind, id, rev? } —— 跨页签数据变化时据此判定弹窗依据是否过期
+  let activeModal = null;
+
   const PAGE_META = {
     dashboard:  ['总览', '生产、检验与放行关键状态一览'],
     queue:      ['批次队列', '全部批次及统一状态标签'],
@@ -66,7 +69,7 @@
   }
   function setReqChip(id) { if (id) $('#reqChip').textContent = '最近请求 ' + id; }
 
-  /** 统一包裹写操作：错误（含放行拦截）弹通知；成功显示请求标识 */
+  /** 统一包裹写操作：错误（含放行拦截/版本冲突）弹通知；成功显示请求标识 */
   function runOp(title, fn) {
     try {
       const r = fn();
@@ -74,7 +77,9 @@
       toast('success', title + '成功', r && r.requestId ? ('请求标识 ' + r.requestId) : '', r && r.requestId);
       return r;
     } catch (e) {
-      if (e.blocked) {
+      if (e.conflict) {
+        toast('warning', '提交冲突（数据已被其他页签/操作者更新）', e.message);
+      } else if (e.blocked) {
         toast('error', '放行被拦截', e.message.replace('放行被拦截：\n', ''));
       } else {
         toast('error', title + '失败', e.message);
@@ -84,7 +89,7 @@
   }
 
   /* ---------------- Modal ---------------- */
-  function closeModal() { $('#modalRoot').innerHTML = ''; }
+  function closeModal() { $('#modalRoot').innerHTML = ''; activeModal = null; }
   function openModal(opt) {
     const root = $('#modalRoot');
     root.innerHTML =
@@ -98,8 +103,26 @@
           ${opt.footer !== false ? `<div class="modal-foot">${opt.footer || '<button class="btn btn-outline" data-close-modal type="button">关闭</button>'}</div>` : ''}
         </div>
       </div>`;
+    activeModal = opt.context || null;
     if (opt.onMount) opt.onMount(root.querySelector('.modal'));
     return root.querySelector('.modal');
+  }
+
+  /** 将当前弹窗标记为“依据已过期”：禁用提交并提示重新打开 */
+  function markModalStale(message) {
+    const modalEl = document.querySelector('.modal');
+    if (!modalEl) return;
+    const body = modalEl.querySelector('.modal-body');
+    if (body && !body.querySelector('.stale-banner')) {
+      const banner = document.createElement('div');
+      banner.className = 'banner banner-danger stale-banner';
+      banner.style.marginBottom = '12px';
+      banner.innerHTML = `⛔ ${esc(message || '该弹窗依据的数据已被其他页签更新，不能继续提交。')}
+        <button class="btn btn-danger btn-xs" type="button" style="margin-left:8px" data-act="close-and-refresh">按最新数据重新打开</button>`;
+      body.insertBefore(banner, body.firstChild);
+    }
+    modalEl.querySelectorAll('.modal-foot button[type="submit"], .modal-foot .btn-success, .modal-foot .btn-warning, .modal-foot .btn-primary')
+      .forEach(b => { b.disabled = true; });
   }
 
   /* ---------------- 导航刷新 ---------------- */
@@ -391,6 +414,7 @@
             <div class="cell-sub">${esc(b.product)} · ${esc(b.lineCode)} · ${b.quantity.toLocaleString()} 件</div>
           </div>
           ${batchTag(b.status)}
+          <span class="tag tag-VOID mono" title="批次数据版本：他页签每改动一次检验/决定即 +1，提交决定时按此版本乐观加锁">v${b.rev || 1}</span>
           <span style="flex:1"></span>
           <div class="dl-btns">
             <button class="btn btn-outline btn-sm" data-act="open-batch" data-id="${b.id}">批次详情</button>
@@ -595,6 +619,7 @@
     openModal({
       lg: true,
       title: '批次详情',
+      context: { kind: 'batch', id: b.id, rev: b.rev || 1 },
       body: `
         <div class="detail-head">
           <div>
@@ -610,6 +635,7 @@
           <div class="meta-item"><div class="k">执行标准</div><div class="v">${esc(b.standard)}</div></div>
           <div class="meta-item"><div class="k">登记人</div><div class="v">${esc(b.createdByName)}</div></div>
           <div class="meta-item"><div class="k">登记时间</div><div class="v">${fmt(b.createdAt)}</div></div>
+          <div class="meta-item"><div class="k">数据版本</div><div class="v mono">v${b.rev || 1}</div></div>
         </div>
 
         <div class="section-title">放行条件核查</div>
@@ -704,6 +730,7 @@
 
     openModal({
       title: `录入检验结果 · ${s.code}`,
+      context: { kind: 'inspect', id: s.id, batchId: s.batchId, rev: b.rev || 1 },
       body: `
         <div class="banner banner-info">批次 <b class="mono">${esc(b.batchNo)}</b>（${esc(b.product)}）·
           ${round > 1 ? `第 ${round} 轮复测录入` : '首轮检验'}。任一项不合格，样本将自动转入待复测。</div>
@@ -739,13 +766,20 @@
         </label>`;
     }).join('');
 
+    const expectedRev = b.rev || 1;
     openModal({
       title: `放行审批 · ${b.batchNo}`,
+      context: { kind: 'decision', id: b.id, rev: expectedRev },
       body: `
         ${ev.canRelease
           ? `<div class="banner banner-success">✅ 四项放行条件全部满足，可以放行。</div>`
           : `<div class="banner banner-danger">⛔ 放行条件不满足，<b>“放行”已被系统锁定</b>，请选择隔离 / 返工 / 拒收并说明依据。</div>`}
-        <form id="decisionForm" data-form="submit-decision" data-batch-id="${b.id}">
+        <div class="banner banner-info" style="margin-bottom:12px">
+          本决定基于批次数据 <b class="mono">v${expectedRev}</b>（状态「${S.BATCH_STATUS[b.status].name}」）。
+          提交时系统将按当前数据重新复核；若其他页签在此期间改动了该批次，本次提交会被判定为冲突。
+        </div>
+        <form id="decisionForm" data-form="submit-decision" data-batch-id="${b.id}" data-expected-rev="${expectedRev}">
+          <input type="hidden" name="expectedRev" value="${expectedRev}">
           <div class="check-list" style="margin-bottom:14px">${opts}</div>
           <div class="form-field">
             <label>决定依据 / 处置说明 *</label>
@@ -849,8 +883,17 @@
       const batchId = form.dataset.batchId;
       const picked = form.querySelector('input[name="decisionType"]:checked');
       if (!picked) { toast('warning', '请选择决定类型', '放行 / 隔离 / 返工 / 拒收 四选一'); return; }
+      const expectedRev = Number(form.dataset.expectedRev);
+      // 提交前再按内存中已被 storage 事件同步的最新数据复核一次版本
+      const current = S.getBatch(batchId);
+      if (current && (current.rev || 1) !== expectedRev) {
+        toast('warning', '数据版本冲突',
+          `该弹窗依据 v${expectedRev}，批次已更新到 v${current.rev || 1}（当前「${S.BATCH_STATUS[current.status].name}」），请按最新数据重新打开决定弹窗。`);
+        markModalStale(`数据已更新到 v${current.rev || 1}，本弹窗依据的 v${expectedRev} 已过期。`);
+        return;
+      }
       const r = runOp('提交决定', () => S.submitDecision(
-        { batchId, type: picked.value, note: form.elements.note.value }, user));
+        { batchId, type: picked.value, note: form.elements.note.value, expectedRev }, user));
       if (r) {
         closeModal();
         if (route === 'approval') render();
@@ -956,6 +999,48 @@
     $('#userRole').textContent = D.ROLES[user.role].name;
     render();
     toast('success', '已切换登录角色', `${user.name} · ${D.ROLES[user.role].name}`);
+  });
+
+  /* ---------------- 跨页签实时同步 ----------------
+   * 其他页签写入后（storage 事件由领域层监听并回调）：
+   *  - 审批列表/队列/总览/审计立即按最新数据重渲染；
+   *  - 打开中的决定弹窗若批次 rev 已变化，置灰并提示冲突，必须按最新数据重开；
+   *  - 批次详情/检验录入等弹窗直接重开为最新内容（录入中断会关闭，避免盲写）。
+   */
+  S.onExternalChange(() => {
+    refreshChrome();
+    render();
+
+    const ctx = activeModal;
+    if (!ctx) return;
+    if (ctx.kind === 'decision') {
+      const fresh = S.getBatch(ctx.id);
+      if (!fresh) { closeModal(); return; }
+      if ((fresh.rev || 1) !== ctx.rev) {
+        const terminal = S.TERMINAL_STATUS.includes(fresh.status);
+        markModalStale(terminal
+          ? `批次已被其他页签决定为「${S.BATCH_STATUS[fresh.status].name}」，本决定不能再提交。`
+          : `批次数据已从 v${ctx.rev} 更新到 v${fresh.rev || 1}（当前「${S.BATCH_STATUS[fresh.status].name}」），请按最新检验结果重新复核。`);
+      }
+    } else if (ctx.kind === 'inspect') {
+      const fresh = S.getBatch(ctx.batchId);
+      if (!fresh || (fresh.rev || 1) !== ctx.rev || S.TERMINAL_STATUS.includes(fresh.status)) {
+        markModalStale('该样本/批次刚被其他页签更新，为避免覆盖他人录入，本表单已关闭。请重新打开。');
+      }
+    } else if (ctx.kind === 'batch') {
+      const fresh = S.getBatch(ctx.id);
+      if (fresh && (fresh.rev || 1) !== ctx.rev) openBatchDetail(ctx.id); // 详情弹窗无感刷新
+    }
+  });
+
+  // 弹窗内“按最新数据重新打开”按钮
+  document.addEventListener('click', e => {
+    if (e.target.matches('[data-act="close-and-refresh"]')) {
+      const ctx = activeModal;
+      closeModal();
+      if (ctx && ctx.kind === 'decision') openDecision(ctx.id);
+      else render();
+    }
   });
 
   /* ---------------- 启动 ---------------- */

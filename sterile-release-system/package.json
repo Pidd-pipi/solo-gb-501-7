@@ -7,9 +7,10 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "node tests/store.test.js && node tests/ui.smoke.test.js",
+    "test": "node tests/store.test.js && node tests/concurrency.test.js && node tests/ui.smoke.test.js && node tests/twotab.ui.test.js",
     "test:unit": "node tests/store.test.js",
-    "test:ui": "node tests/ui.smoke.test.js",
+    "test:concurrency": "node tests/concurrency.test.js",
+    "test:ui": "node tests/ui.smoke.test.js && node tests/twotab.ui.test.js",
     "serve": "python3 -m http.server 8080"
   },
   "license": "ISC",

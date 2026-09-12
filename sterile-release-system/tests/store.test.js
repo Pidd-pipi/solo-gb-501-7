@@ -196,7 +196,7 @@ test('全部合格 → 放行成功，批次已放行且记录锁定', () => {
   assert.strictEqual(r.batch.status, 'RELEASED');
   // 已放行批次检验锁定
   expectThrow(() => Store.saveInspection({ sampleId: samples[0].id, results: GOOD }, insp), '已锁定');
-  expectThrow(() => Store.submitDecision({ batchId: batch.id, type: 'RELEASE', note: '重复放行重复放行' }, appr), '不能重复提交');
+  expectThrow(() => Store.submitDecision({ batchId: batch.id, type: 'RELEASE', note: '重复放行重复放行' }, appr), '提交冲突');
 });
 test('放行依据过短被拒', () => {
   Store.resetState();

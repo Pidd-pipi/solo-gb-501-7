@@ -93,10 +93,16 @@
 
   function findItem(list, id) { return list.find(x => x.id === id); }
 
-  /* ============================ 状态存储 ============================ */
+  /* ============================ 状态存储 ============================
+   * 多页签并发策略：
+   *  - state.revision 为全局单调版本，任何写操作 +1 并落盘；
+   *  - 每次写操作前 hydrate() 从持久层合并最新状态，过期页签不会整份覆盖；
+   *  - 批次另有 rev，提交放行决定时做乐观锁校验（expectedRev）。
+   */
   function defaultState() {
     return {
       version: 1,
+      revision: 0,
       lines: Data.LINES.map(l => ({ ...l })),
       batches: [],
       samples: [],
@@ -111,30 +117,89 @@
   let memoryStore = null;
   const hasLocalStorage = typeof localStorage !== 'undefined';
 
-  function load() {
+  function loadRaw() {
     if (hasLocalStorage) {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) return JSON.parse(raw);
       } catch (e) { /* 损坏数据按空状态重建 */ }
     }
-    if (!memoryStore) memoryStore = defaultState();
     return memoryStore;
   }
 
-  function persist(state) {
+  function load() {
+    const s = loadRaw();
+    if (s) {
+      if (typeof s.revision !== 'number') s.revision = 0;
+      return s;
+    }
+    memoryStore = defaultState();
+    return memoryStore;
+  }
+
+  function persist(nextState) {
     if (hasLocalStorage) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
     } else {
-      memoryStore = state;
+      memoryStore = nextState;
     }
   }
 
   let state = load();
+  let knownRevision = state.revision;
   // 与存储内序列号对齐，避免 requestId 序号回退
   _seq = (state.audit && state.audit.length) || 0;
 
-  function save() { persist(state); }
+  /**
+   * 写操作前调用：放弃本页签的过期内存副本，改用持久层最新状态。
+   * 任何页签的写入都会先落盘，因此后续写入者看到的永远是最新数据。
+   */
+  function hydrate() {
+    const latest = loadRaw();
+    if (latest && latest.revision !== undefined && latest.revision > knownRevision) {
+      state = latest;
+      knownRevision = latest.revision;
+      _seq = state.audit.length;
+    } else if (latest) {
+      state = latest;
+    }
+    return state;
+  }
+
+  /** 落盘并推进全局版本 */
+  function save() {
+    state.revision = (state.revision || 0) + 1;
+    knownRevision = state.revision;
+    persist(state);
+    return state.revision;
+  }
+
+  /** 浏览器跨页签 storage 事件：其他页签写入后刷新内存并通知 UI */
+  const externalListeners = [];
+  function onExternalChange(fn) {
+    externalListeners.push(fn);
+    return () => {
+      const i = externalListeners.indexOf(fn);
+      if (i >= 0) externalListeners.splice(i, 1);
+    };
+  }
+  if (hasLocalStorage && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('storage', function (e) {
+      if (e.key !== STORAGE_KEY || !e.newValue) return;
+      const before = knownRevision;
+      let incoming = null;
+      try { incoming = JSON.parse(e.newValue); } catch (_) { return; } // 忽略损坏负载
+      state = incoming;
+      if (typeof incoming.revision === 'number') knownRevision = incoming.revision;
+      _seq = (incoming.audit || []).length;
+      // 外部写入一律通知（数据重置会让 revision 回绕，不能仅按版本增大判断）；
+      // UI 用各批次 rev 判断自己打开的依据是否过期
+      externalListeners.forEach(fn => {
+        try { fn({ revision: knownRevision, previousRevision: before }); } catch (_) {}
+      });
+    });
+  }
+
 
   /* ============================ 权限与审计 ============================ */
   function requirePerm(perm, user) {
@@ -242,6 +307,7 @@
   }
 
   function createBatch(input, user) {
+    hydrate();
     requirePerm('batch.create', user);
 
     const line = findItem(state.lines, input.lineId);
@@ -271,6 +337,7 @@
       quantity: qty,
       standard: (input.standard || 'ISO 11607').trim() || 'ISO 11607',
       status: 'PENDING_INSPECTION',
+      rev: 1, // 批次乐观锁版本：每次影响放行判定的数据变更 +1
       createdBy: user.id,
       createdByName: user.name,
       createdAt: ts,
@@ -314,6 +381,7 @@
 
   /* ============================ 用例：录入检验结果（检验员） ============================ */
   function saveInspection(input, user) {
+    hydrate();
     requirePerm('inspection.save', user);
 
     const sample = findItem(state.samples, input.sampleId);
@@ -408,6 +476,7 @@
       sample.status = 'RETEST';
     }
     batch.updatedAt = ts;
+    batch.rev = (batch.rev || 0) + 1; // 检验数据变化 → 打开中的决定弹窗所依据版本过期
     recomputeBatchStatus(batch,
       overallPass
         ? (isRetestRound ? '样本复测合格' : '样本检验合格')
@@ -425,6 +494,7 @@
    * 复测在原样本上开新一轮记录，审计链完整保留。
    */
   function requestRetest(sampleId, user) {
+    hydrate();
     requirePerm('inspection.retest', user);
     const sample = findItem(state.samples, sampleId);
     if (!sample) throw new Error('检验样本不存在');
@@ -440,6 +510,7 @@
     // 保持「待复测」状态不变，仅开放新一轮结果录入；首轮结果保留在 history
     sample.awaitingRetestRound = nextRound;
     batch.updatedAt = ts;
+    batch.rev = (batch.rev || 0) + 1; // 复测安排变化 → 放行依据版本过期
 
     appendAudit('RETEST_REQUESTED', user, [
       { field: 'sample', label: '样本编号', before: '', after: sample.code },
@@ -452,6 +523,7 @@
 
   /* ============================ 用例：返工后补样（检验员） ============================ */
   function addSamples(input, user) {
+    hydrate();
     requirePerm('sample.add', user);
     const batch = findItem(state.batches, input.batchId);
     if (!batch) throw new Error('批次不存在');
@@ -479,6 +551,7 @@
       created.push(sample);
     }
     batch.updatedAt = ts;
+    batch.rev = (batch.rev || 0) + 1; // 补样改变放行依据
     recomputeBatchStatus(batch, `返工后补取样 ${count} 个`);
 
     appendAudit('SAMPLES_ADDED', user, [
@@ -561,17 +634,51 @@
     };
   }
 
-  /* ============================ 用例：提交放行决定（审批员） ============================ */
+  /* ============================ 用例：提交放行决定（审批员） ============================
+   * 多页签并发保护：
+   *  1. hydrate() —— 以持久层最新数据为基准，拒绝用过期内存副本覆盖新写入；
+   *  2. expectedRev 乐观锁 —— 页面必须提交打开弹窗时看到的批次版本，不一致即冲突；
+   *  3. 放行类型按当前最新数据重新执行 evaluateRelease 四项前置条件复核。
+   */
+  function conflictError(message, extra) {
+    const err = new Error(message);
+    err.conflict = true;
+    if (extra) Object.assign(err, extra);
+    return err;
+  }
+
   function submitDecision(input, user) {
+    hydrate();
     requirePerm('decision.submit', user);
     const batch = findItem(state.batches, input.batchId);
     if (!batch) throw new Error('批次不存在');
 
     const type = input.type;
     if (!Data.DECISION_TYPES[type]) throw new Error('未知的放行决定类型');
+
+    const currentRev = batch.rev || 1;
+
+    // 终态优先拦截：其他页签可能已放行/拒收，绝不能重复提交或覆盖生效决定
     if (TERMINAL_STATUS.includes(batch.status)) {
-      throw new Error(`批次已「${BATCH_STATUS[batch.status].name}」，决定已生效不能重复提交`);
+      const last = latestDecision(batch.id);
+      throw conflictError(
+        `提交冲突：批次 ${batch.batchNo} 已由其他操作决定为「${BATCH_STATUS[batch.status].name}」` +
+        (last ? `（${last.decidedByName} · ${fmtTime(last.decidedAt)}）` : '') +
+        '，批次已关闭，您的决定未写入。请刷新页面查看最新状态。',
+        { code: 'TERMINAL', currentRev });
     }
+
+    // 乐观并发：版本对不上说明本弹窗依据的数据已被其他页签/操作者改动
+    if (input.expectedRev !== undefined && input.expectedRev !== null && input.expectedRev !== '') {
+      const expected = Number(input.expectedRev);
+      if (Number.isFinite(expected) && expected !== currentRev) {
+        throw conflictError(
+          `数据版本冲突：该决定依据的是批次第 ${expected} 版数据，此后批次已被其他操作更新到第 ${currentRev} 版` +
+          `（当前状态「${BATCH_STATUS[batch.status].name}」）。请刷新并按最新检验数据重新复核后再提交，本次决定未写入。`,
+          { code: 'REV_MISMATCH', expectedRev: expected, currentRev });
+      }
+    }
+
     // 待审批可直接决定；已隔离批次允许经调查后重新处置（改判返工/拒收/放行）
     if (batch.status !== 'PENDING_REVIEW' && batch.status !== 'QUARANTINED') {
       throw new Error(`批次当前为「${BATCH_STATUS[batch.status].name}」，检验流程未完成，不能提交审批决定`);
@@ -582,7 +689,7 @@
     const ts = Date.now();
     const reqId = newRequestId();
 
-    // 放行必须通过硬条件；隔离/返工/拒收不受限（本身就是不合格处置）
+    // 放行必须基于「当前最新数据」复核硬条件；隔离/返工/拒收不受限（本身就是不合格处置）
     let evaluation = null;
     if (type === 'RELEASE') {
       evaluation = evaluateRelease(batch.id);
@@ -601,6 +708,7 @@
       batchNo: batch.batchNo,
       type,
       note,
+      basedOnRev: currentRev, // 审计可查：本决定基于第几版批次数据
       decidedBy: user.id,
       decidedByName: user.name,
       decidedAt: ts,
@@ -628,11 +736,13 @@
 
     setBatchStatus(batch, nextStatus, `${Data.DECISION_TYPES[type].name}决定：${note}`);
     batch.updatedAt = ts;
+    batch.rev = currentRev + 1; // 决定生效 → 版本推进，其他页签的在途提交立即过期
     batch.lastDecisionId = decision.id;
 
     appendAudit('DECISION_SUBMITTED', user, [
       { field: 'batchNo', label: '批次号', before: '', after: batch.batchNo },
       { field: 'decision', label: '决定', before: '', after: Data.DECISION_TYPES[type].name },
+      { field: 'basedOnRev', label: '依据数据版本', before: '', after: `第 ${currentRev} 版` },
       { field: 'note', label: '依据', before: '', after: note }
     ], { type: 'batch', id: batch.id }, reqId);
 
@@ -642,6 +752,7 @@
 
   /* ============================ 用例：产线维护（质量管理员） ============================ */
   function setLineActive(lineId, active, user) {
+    hydrate();
     requirePerm('line.manage', user);
     const line = findItem(state.lines, lineId);
     if (!line) throw new Error('产线不存在');
@@ -750,6 +861,8 @@
     getState, getUser, getBatch, getSample, getSamples, decisionsOf, latestDecision,
     // 管理
     resetState, seedDemoData,
+    // 多页签并发
+    hydrate, onExternalChange,
     // 测试辅助
     _nextBatchNo: nextBatchNo, _recompute: recomputeBatchStatus
   };

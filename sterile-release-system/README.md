@@ -17,10 +17,23 @@ python3 -m http.server 8080
 ## 测试
 
 ```bash
-npm test                # 领域层 32 项 + jsdom 浏览器主线冒烟
+npm test                # 领域 32 项 + 并发 9 项 + 单页签 UI 冒烟 + 双页签场景
 npm run test:unit       # 仅领域层（状态机 / 权限 / 放行规则 / 审计链）
-npm run test:ui         # 仅浏览器冒烟（真实 DOM 点击与表单提交）
+npm run test:concurrency # 多页签并发（写前合并 / 乐观锁 / 冲突裁决）
+npm run test:ui         # jsdom 浏览器场景（含两个共享存储的页签）
 ```
+
+## 多页签并发安全
+
+多个页签同时打开时，系统通过三层机制避免“过期页面覆盖新判定”：
+
+1. **写前合并（hydrate）**：每个写操作落盘前先从 `localStorage` 读取最新状态再合并写入，过期页签不会整份覆盖他人数据；全局 `revision` 单调推进。
+2. **跨页签实时同步**：监听浏览器 `storage` 事件，其他页签登记批次/录入检验后，本页签的审批列表、队列、徽标立即自动刷新；正在打开的放行决定弹窗若依据版本已变化，会显示冲突横幅并禁用提交，必须按最新数据重新打开（数据重置导致版本回绕也能正确同步）。
+3. **提交前复核 + 批次乐观锁**：批次带数据版本 `rev`，决定弹窗打开时记录该版本（表单隐藏字段 + 弹窗提示 `vN`）。提交时领域层先 hydrate 到最新数据，再校验 `expectedRev === batch.rev`，然后**按当前数据重新执行四项放行条件核查**：
+   - 版本不一致 → `REV_MISMATCH` 冲突，决定不写入；
+   - 两个页签持同一版本先后提交 → 先落盘者生效，后到者看到终态得到 `TERMINAL` 冲突（“批次已由其他操作决定为已放行/拒收”），恰好一条成功；
+   - 即使版本相同，若他页签刚把检验结果改为不合格，RELEASE 仍会被最新的放行核查拦截。
+   每条决定的审计记录包含「依据数据版本：第 N 版」。
 
 ## 角色与权限（RBAC）
 
@@ -68,10 +81,12 @@ npm run test:ui         # 仅浏览器冒烟（真实 DOM 点击与表单提交�
 index.html            五个页面（总览/批次队列/检验工作台/放行审批/审计记录）
 css/styles.css
 js/data.js            用户、角色、检验项、产线、决定类型（静态主数据）
-js/store.js           领域层：状态机 / RBAC / 审计哈希链 / 放行规则 / localStorage
+js/store.js           领域层：状态机 / RBAC / 审计哈希链 / 放行规则 / 多页签版本控制 / localStorage
 js/app.js             页面层：路由、弹窗、权限化渲染、操作回执
-tests/store.test.js   领域层测试（Node）
-tests/ui.smoke.test.js 浏览器主线冒烟（jsdom）
+tests/store.test.js    领域层测试（Node）
+tests/concurrency.test.js 多页签并发：共享存储双实例（hydrate/乐观锁/冲突/审计链）
+tests/ui.smoke.test.js 单页签浏览器主线冒烟（jsdom）
+tests/twotab.ui.test.js 双页签实时同步与并发决定冲突（jsdom × 2）
 ```
 
 > 首次打开自动生成覆盖各状态的演示批次；质量管理员可在左下角「重置演示数据」。
