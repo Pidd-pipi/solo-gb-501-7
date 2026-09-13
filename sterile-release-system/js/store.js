@@ -117,21 +117,75 @@
   let memoryStore = null;
   const hasLocalStorage = typeof localStorage !== 'undefined';
 
-  function loadRaw() {
-    if (hasLocalStorage) {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) return JSON.parse(raw);
-      } catch (e) { /* 损坏数据按空状态重建 */ }
+  /**
+   * 存储损坏错误：持久层存在内容但无法解析或结构不合法。
+   * 出现该错误时所有写操作被阻止，必须由质量管理员显式 forceReset（先备份原始数据），
+   * 绝不允许静默按空状态重建后覆盖损坏数据。
+   */
+  function StateCorruptError(message, cause) {
+    const err = new Error(message);
+    err.name = 'StateCorruptError';
+    err.code = 'STATE_CORRUPT';
+    if (cause) err.cause = cause;
+    return err;
+  }
+
+  const CORRUPT_BACKUP_KEY = STORAGE_KEY + '.corrupt-backup';
+
+  /** 严格解析 + 结构校验；空（首次使用）返回 null；损坏抛 StateCorruptError */
+  function parseStored(raw) {
+    if (raw === null || raw === undefined || raw === '') return null;
+    let s;
+    try {
+      s = JSON.parse(raw);
+    } catch (e) {
+      throw StateCorruptError('持久化数据不是合法的 JSON（可能被截断或手工改写），为避免数据丢失，系统已阻止读写，请联系质量管理员处理。', e.message);
     }
+    if (typeof s !== 'object' || s === null || Array.isArray(s)) {
+      throw StateCorruptError('持久化数据结构非法：顶层不是对象，拒绝加载。');
+    }
+    const requiredArrays = ['lines', 'batches', 'samples', 'decisions', 'audit'];
+    for (const k of requiredArrays) {
+      if (!Array.isArray(s[k])) {
+        throw StateCorruptError(`持久化数据结构非法：缺少或损坏了「${k}」数组，拒绝加载（不会清空原数据）。`);
+      }
+    }
+    if (s.seq === undefined || s.seq === null) {
+      s.seq = { batch: 0, sample: 0, decision: 0 };
+    } else if (typeof s !== 'object' || Array.isArray(s.seq) ||
+               typeof s.seq.batch !== 'number' || typeof s.seq.sample !== 'number' || typeof s.seq.decision !== 'number') {
+      throw StateCorruptError('持久化数据结构非法：序列号字段 seq 损坏，拒绝加载。');
+    }
+    // revision 缺失视为旧版数据，兼容迁移为 0；类型错误才判损坏
+    if (s.revision === undefined || s.revision === null) s.revision = 0;
+    if (typeof s.revision !== 'number' || !Number.isFinite(s.revision)) {
+      throw StateCorruptError('持久化数据结构非法：版本号 revision 不是数值，拒绝加载。');
+    }
+    return s;
+  }
+
+  /** 读取持久层原始字符串（不解析），用于取证备份 */
+  function readRawString() {
+    if (!hasLocalStorage) return null;
+    return localStorage.getItem(STORAGE_KEY);
+  }
+
+  /** 读取并校验持久层：空→null；损坏→StateCorruptError */
+  function loadRaw() {
+    if (hasLocalStorage) return parseStored(localStorage.getItem(STORAGE_KEY));
     return memoryStore;
   }
 
+  // 启动时若存储已损坏，错误记录在此（getLoadError 暴露给 UI）；必须在 load() 调用前声明
+  let loadError = null;
+
   function load() {
-    const s = loadRaw();
-    if (s) {
-      if (typeof s.revision !== 'number') s.revision = 0;
-      return s;
+    try {
+      const s = loadRaw();
+      if (s) return s;
+    } catch (e) {
+      // 启动即损坏：记下错误（UI 告警、写入拦截），内存用空状态支撑只读浏览
+      loadError = e;
     }
     memoryStore = defaultState();
     return memoryStore;
@@ -153,15 +207,14 @@
   /**
    * 写操作前调用：放弃本页签的过期内存副本，改用持久层最新状态。
    * 任何页签的写入都会先落盘，因此后续写入者看到的永远是最新数据。
+   * 持久层损坏时直接抛 StateCorruptError，阻止后续写入覆盖。
    */
   function hydrate() {
-    const latest = loadRaw();
-    if (latest && latest.revision !== undefined && latest.revision > knownRevision) {
+    const latest = loadRaw(); // 损坏会在此抛出 StateCorruptError
+    if (latest) {
       state = latest;
       knownRevision = latest.revision;
       _seq = state.audit.length;
-    } else if (latest) {
-      state = latest;
     }
     return state;
   }
@@ -185,18 +238,35 @@
   }
   if (hasLocalStorage && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
     window.addEventListener('storage', function (e) {
-      if (e.key !== STORAGE_KEY || !e.newValue) return;
+      if (e.key !== STORAGE_KEY) return;
       const before = knownRevision;
-      let incoming = null;
-      try { incoming = JSON.parse(e.newValue); } catch (_) { return; } // 忽略损坏负载
-      state = incoming;
-      if (typeof incoming.revision === 'number') knownRevision = incoming.revision;
-      _seq = (incoming.audit || []).length;
-      // 外部写入一律通知（数据重置会让 revision 回绕，不能仅按版本增大判断）；
-      // UI 用各批次 rev 判断自己打开的依据是否过期
-      externalListeners.forEach(fn => {
-        try { fn({ revision: knownRevision, previousRevision: before }); } catch (_) {}
-      });
+      // 其他页签清空了存储（合法的重置）→ 回到空状态
+      if (!e.newValue) {
+        state = defaultState();
+        knownRevision = 0;
+        loadError = null;
+        _seq = 0;
+        externalListeners.forEach(fn => {
+          try { fn({ revision: 0, previousRevision: before, reset: true }); } catch (_) {}
+        });
+        return;
+      }
+      // 严格校验外部写入：损坏不静默接受，置错误标志并通知 UI
+      try {
+        const incoming = parseStored(e.newValue);
+        state = incoming;
+        knownRevision = incoming.revision;
+        loadError = null;
+        _seq = incoming.audit.length;
+        externalListeners.forEach(fn => {
+          try { fn({ revision: knownRevision, previousRevision: before }); } catch (_) {}
+        });
+      } catch (err) {
+        loadError = err;
+        externalListeners.forEach(fn => {
+          try { fn({ revision: knownRevision, previousRevision: before, corrupt: true, error: err }); } catch (_) {}
+        });
+      }
     });
   }
 
@@ -782,13 +852,46 @@
     return list.length ? list[list.length - 1] : null;
   }
 
-  /* ============================ 重置与演示数据 ============================ */
+  /* ============================ 重置、损坏恢复与演示数据 ============================ */
+  function backupCorruptPayload() {
+    if (!hasLocalStorage) return false;
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    try {
+      parseStored(raw);
+      return false; // 数据合法，无需备份
+    } catch (_) {
+      // 原始损坏数据移入独立取证键，避免“恢复”动作直接销毁现场
+      localStorage.setItem(CORRUPT_BACKUP_KEY, raw);
+      return true;
+    }
+  }
+
   function resetState(user) {
     if (user) requirePerm('data.reset', user);
+    const backedUp = backupCorruptPayload();
     state = defaultState();
+    knownRevision = 0;
+    loadError = null;
     _seq = 0;
     save();
-    return state;
+    return { state, corruptBackupCreated: backedUp, backupKey: backedUp ? CORRUPT_BACKUP_KEY : null };
+  }
+
+  /**
+   * 显式损坏恢复（质量管理员）：先备份损坏原文，再初始化为空状态。
+   * 与普通 reset 的区别是返回值明确告知是否发生过取证备份，绝不静默丢弃。
+   */
+  function forceReset(user) {
+    requirePerm('data.reset', user);
+    return resetState();
+  }
+
+  function getLoadError() { return loadError; }
+  function storageHealth() {
+    return loadError
+      ? { ok: false, code: 'STATE_CORRUPT', message: loadError.message, backupKey: CORRUPT_BACKUP_KEY }
+      : { ok: true, code: 'OK', message: '存储结构正常' };
   }
 
   /**
@@ -796,7 +899,11 @@
    * allOps 用同一操作者串起来，保证审计链真实生成。
    */
   function seedDemoData(now) {
+    // 即使是演示数据重置，也不能覆盖损坏的原始数据：先取证备份
+    backupCorruptPayload();
     state = defaultState();
+    knownRevision = 0;
+    loadError = null;
     save();
     const base = (now || Date.now());
     const op = Data.USERS[0], insp = Data.USERS[1], appr = Data.USERS[2];
@@ -860,7 +967,9 @@
     // 查询
     getState, getUser, getBatch, getSample, getSamples, decisionsOf, latestDecision,
     // 管理
-    resetState, seedDemoData,
+    resetState, forceReset, seedDemoData,
+    // 存储健康 / 损坏检测
+    getLoadError, storageHealth,
     // 多页签并发
     hydrate, onExternalChange,
     // 测试辅助

@@ -1007,7 +1007,17 @@
    *  - 打开中的决定弹窗若批次 rev 已变化，置灰并提示冲突，必须按最新数据重开；
    *  - 批次详情/检验录入等弹窗直接重开为最新内容（录入中断会关闭，避免盲写）。
    */
-  S.onExternalChange(() => {
+  S.onExternalChange((info) => {
+    // 其他页签写入了无法解析/结构损坏的数据：显示恢复页，不接受该状态
+    if (info && info.corrupt) {
+      toast('error', '检测到损坏的存储数据', (info.error && info.error.message) || '存储数据损坏，写操作已被阻止');
+      showCorruptScreen(info.error);
+      return;
+    }
+    if (info && info.reset) {
+      closeModal();
+      toast('warning', '数据已被其他页签重置', '当前视图已切换为空库状态');
+    }
     refreshChrome();
     render();
 
@@ -1043,16 +1053,54 @@
     }
   });
 
-  /* ---------------- 启动 ---------------- */
+  /* ---------------- 存储损坏恢复页 ---------------- */
+  function showCorruptScreen(err) {
+    view.innerHTML = `
+      <div class="card" style="max-width:720px;margin:24px auto;border-color:#f2c3bd">
+        <div class="banner banner-danger" style="margin-bottom:14px">
+          ⛔ <div><b>持久化数据已损坏，系统已阻止读写以防数据丢失。</b><br>
+          损坏详情：${esc(err && err.message || '未知错误')}</div>
+        </div>
+        <div class="kvline" style="line-height:1.8">
+          • 损坏的原始数据保留在浏览器存储键 <span class="mono">sr_system_state_v1.corrupt-backup</span>，可导出取证；<br>
+          • 由质量管理员确认后可执行“备份并恢复为空库”；普通角色请联系质量管理员处理；<br>
+          • 未恢复前，任何批次登记、检验录入、放行决定等写操作都会被拒绝并报 STATE_CORRUPT。
+        </div>
+        <div style="margin-top:16px;display:flex;gap:10px">
+          ${can('data.reset')
+            ? `<button class="btn btn-danger" id="corruptForceReset">备份损坏数据并恢复空库</button>`
+            : '<span class="muted">当前角色无恢复权限，请以质量管理员身份重新打开。</span>'}
+          <button class="btn btn-outline" id="corruptRetry">重新检测</button>
+        </div>
+      </div>`;
+    const btn = document.querySelector('#corruptForceReset');
+    if (btn) btn.addEventListener('click', () => {
+      const r = runOp('恢复', () => S.forceReset(user));
+      if (r) { S.seedDemoData(); location.hash = '#/dashboard'; render(); }
+    });
+    document.querySelector('#corruptRetry').addEventListener('click', () => {
+      if (!S.getLoadError()) { location.hash = '#/dashboard'; render(); }
+      else toast('error', '存储仍处于损坏状态', S.getLoadError().message);
+    });
+  }
+
   (function boot() {
-    // 空系统自动灌入演示数据
-    if (S.getState().audit.length === 0 && S.getState().batches.length === 0) {
-      S.seedDemoData();
-    }
     $('#userName').textContent = user.name;
     $('#userRole').textContent = D.ROLES[user.role].name;
     if (!PAGE_META[route]) route = 'dashboard';
     location.hash = '#/' + route;
+
+    // 启动即损坏：显式报错页，绝不在损坏存储之上静默建空库或自动灌演示数据
+    const health = S.storageHealth();
+    if (!health.ok) {
+      render();
+      showCorruptScreen(S.getLoadError());
+      return;
+    }
+    // 空系统自动灌入演示数据
+    if (S.getState().audit.length === 0 && S.getState().batches.length === 0) {
+      S.seedDemoData();
+    }
     render();
   })();
 

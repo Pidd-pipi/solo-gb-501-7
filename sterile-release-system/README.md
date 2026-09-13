@@ -17,11 +17,22 @@ python3 -m http.server 8080
 ## 测试
 
 ```bash
-npm test                # 领域 32 项 + 并发 9 项 + 单页签 UI 冒烟 + 双页签场景
-npm run test:unit       # 仅领域层（状态机 / 权限 / 放行规则 / 审计链）
-npm run test:concurrency # 多页签并发（写前合并 / 乐观锁 / 冲突裁决）
-npm run test:ui         # jsdom 浏览器场景（含两个共享存储的页签）
+npm test                  # 6 套测试：领域 / 并发单元 / 并发集成 / 单页签UI / 双页签UI / 损坏恢复UI
+npm run test:unit         # 领域状态机 + 并发/阈值/篡改/损坏单元（确定结果，可反复运行）
+npm run test:concurrency  # 并发单元（24）+ 双实例并发集成（9）
+npm run test:ui           # jsdom 浏览器场景（单页签、双页签、损坏恢复）
 ```
+
+测试文件：
+
+| 文件 | 内容 |
+|---|---|
+| `tests/store.test.js` | 领域层 32 项：RBAC、状态机、复测、放行四条件、隔离/返工、审计链 |
+| `tests/concurrency.units.test.js` | **并发/边界/失败分支单元 24 项（本系统并发契约的权威测试）** |
+| `tests/concurrency.test.js` | 双 vm 实例共享存储的并发集成 9 项 |
+| `tests/ui.smoke.test.js` | 单页签浏览器主线（jsdom 真实点击/表单） |
+| `tests/twotab.ui.test.js` | 两个 jsdom 页签实时同步与并发决定冲突 |
+| `tests/corrupt.ui.test.js` | 存储损坏 → 显式报错页 → QA 备份恢复 |
 
 ## 多页签并发安全
 
@@ -34,6 +45,15 @@ npm run test:ui         # jsdom 浏览器场景（含两个共享存储的页签
    - 两个页签持同一版本先后提交 → 先落盘者生效，后到者看到终态得到 `TERMINAL` 冲突（“批次已由其他操作决定为已放行/拒收”），恰好一条成功；
    - 即使版本相同，若他页签刚把检验结果改为不合格，RELEASE 仍会被最新的放行核查拦截。
    每条决定的审计记录包含「依据数据版本：第 N 版」。
+
+## 存储损坏处理（不静默丢数据）
+
+持久层读取时做严格结构校验（JSON 合法性、五个必备数组、seq、revision 类型）：
+
+- 损坏（截断、手工改写、结构缺失、版本号类型错误）→ 启动进入显式报错页，`storageHealth()` 返回 `STATE_CORRUPT`，`getLoadError()` 给出具体原因；
+- 损坏期间所有写操作在 hydrate 阶段即被拒绝，**绝不会用空状态覆盖损坏原文**；
+- 仅质量管理员可执行「备份损坏数据并恢复空库」：原文先复制到取证键 `sr_system_state_v1.corrupt-backup`，再写入合法空状态；运行中他页签写入损坏数据也会实时弹出恢复页；
+- 旧版本数据缺少 `revision` 字段时按 0 兼容迁移，不算损坏。
 
 ## 角色与权限（RBAC）
 
@@ -83,10 +103,12 @@ css/styles.css
 js/data.js            用户、角色、检验项、产线、决定类型（静态主数据）
 js/store.js           领域层：状态机 / RBAC / 审计哈希链 / 放行规则 / 多页签版本控制 / localStorage
 js/app.js             页面层：路由、弹窗、权限化渲染、操作回执
-tests/store.test.js    领域层测试（Node）
-tests/concurrency.test.js 多页签并发：共享存储双实例（hydrate/乐观锁/冲突/审计链）
-tests/ui.smoke.test.js 单页签浏览器主线冒烟（jsdom）
-tests/twotab.ui.test.js 双页签实时同步与并发决定冲突（jsdom × 2）
+tests/store.test.js              领域层测试（Node）
+tests/concurrency.units.test.js  并发/阈值/篡改/损坏的确定性单元测试
+tests/concurrency.test.js        多页签并发：共享存储双实例（hydrate/乐观锁/冲突）
+tests/ui.smoke.test.js           单页签浏览器主线冒烟（jsdom）
+tests/twotab.ui.test.js          双页签实时同步与并发决定冲突（jsdom × 2）
+tests/corrupt.ui.test.js         存储损坏显式报错与 QA 恢复（jsdom）
 ```
 
 > 首次打开自动生成覆盖各状态的演示批次；质量管理员可在左下角「重置演示数据」。
